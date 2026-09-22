@@ -62,6 +62,7 @@ foreach ($PortName in $AvailablePorts) {
 
 if (-not $TargetPort) {
     Write-Error "GPS device not found on any active COM port. Verify baud rate or connection, then restart script."
+    Read-Host "Press Enter to exit"
     Exit
 }
 
