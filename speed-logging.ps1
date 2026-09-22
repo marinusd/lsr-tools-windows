@@ -121,9 +121,13 @@ try {
                     $LogTimestamp = (Get-Date).ToString("HH:mm:ss")
                     $LogEntry     = "$LogTimestamp,$Mph"
 
-                    # Print cleanly to console and pipe raw string to CSV file
+                    # Print every speed to the console
                     Write-Host "[$LogTimestamp] Speed: $Mph MPH" -ForegroundColor Cyan
-                    Add-Content -Path $LogFile -Value $LogEntry
+
+                    # Only write speeds over 4.0 MPH to the CSV file
+                    if ($Mph -gt 4.0) {
+                        Add-Content -Path $LogFile -Value $LogEntry
+                    }
                 }
             }
         }
