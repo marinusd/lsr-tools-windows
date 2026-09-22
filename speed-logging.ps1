@@ -10,6 +10,7 @@ $LogFile         = "$env:USERPROFILE\Desktop\FAST-stuff\speed-logs\$LocalOffsetN
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) {
     Write-Error "This script must be run as an Administrator to synchronize system time. Please restart PowerShell as Administrator."
+    Read-Host 'Press Enter to exit'
     Exit
 }
 
@@ -136,6 +137,7 @@ try {
 }
 catch {
     Write-Host "`nConnection lost or port changed. Script execution terminated: $_" -ForegroundColor Red
+    Read-Host 'Press Enter to exit'
 }
 finally {
     if ($Port) {
