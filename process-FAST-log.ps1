@@ -120,7 +120,7 @@ try {
 
     [System.IO.File]::WriteAllLines($dst, $lines.ToArray(), $utf8NoBom)
     $dur = ($lastT - $firstT).ToString('0.0', $inv)
-    Write-Host "${src}: $count records, $nchan channels, ${dur}s -> $dst"
+    Write-Host "SUCCESS: ${src}: $count records, $nchan channels, ${dur}s -> $dst"
 }
 catch {
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
