@@ -1,160 +1,149 @@
-<#
-.SYNOPSIS
-    Convert F.A.S.T. Classic (C-Com WP) binary datalogs to CSV.
-
-.DESCRIPTION
-    Windows PowerShell 5.1 (Windows 10 built-in) port of fastlog2csv.sh.
-    No Python or other dependencies required.
-
-    Format (reverse-engineered):
-      0x000   ASCII version ("22"), u16 channel count N, N u16 channel ids
-      0x204   N channel definitions, 58 bytes each:
-                name[16] units[8] u16 u16 u16 f32_scale f32_offset
-                u16 raw_min u16 raw_max f32 disp_max f32 disp_min fmt[8]
-      defs+22 data records: N x u16 raw values + u32 timestamp (ms)
-      Engineering value = raw * scale + offset.
-      MAP stored as raw counts (scale 1.0) is converted to psia using
-      14.7/245 (calibrated from the engine-off atmospheric reading).
-      Coolant and air temp remain raw sensor counts.
-
-.PARAMETER Path
-    One or more .log files. Wildcards allowed (e.g. *.log).
-
-.PARAMETER OutDir
-    Optional output folder. Default: same folder as each input file.
-
-.EXAMPLE
-    .\fastlog2csv.ps1 dyno-run-2.log
-.EXAMPLE
-    .\fastlog2csv.ps1 C:\Logs\*.log -OutDir C:\Logs\csv
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\fastlog2csv.ps1 run1.log run2.log
-#>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0, ValueFromRemainingArguments = $true,
-               ValueFromPipeline = $true, ValueFromPipelineByPropertyName = $true)]
-    [Alias('FullName')]
-    [string[]]$Path,
+    # Output directory. If omitted, each CSV is written next to its input log.
+    [Alias('o')]
+    [string]$OutDir,
 
-    [string]$OutDir
+    # One or more F.A.S.T. Classic log files.
+    [Parameter(Mandatory = $true, Position = 0, ValueFromRemainingArguments = $true)]
+    [string[]]$InputFile
 )
 
-begin {
-    Set-StrictMode -Version 2
-    $ErrorActionPreference = 'Stop'
-    $inv = [System.Globalization.CultureInfo]::InvariantCulture   # always '.' decimals
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
 
-    $DEF0  = 0x204
-    $DEFSZ = 58
-    $MAP_PSIA_PER_COUNT = 14.7 / 245
+function Show-Usage {
+    @"
+FastLog2CSV.ps1 - convert F.A.S.T. Classic (C-Com WP) binary datalogs to CSV.
 
-    if ($OutDir) {
-        if (-not (Test-Path -LiteralPath $OutDir)) {
-            New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
-        }
-        $OutDir = (Resolve-Path -LiteralPath $OutDir).ProviderPath
-    }
+Usage:
+  .\FastLog2CSV.ps1 [-OutDir <directory>] <file1.log> [<file2.log> ...]
 
-    function Get-CString([byte[]]$buf, [int]$off, [int]$len) {
-        $end = $off
-        while ($end -lt $off + $len -and $buf[$end] -ne 0) { $end++ }
-        return [System.Text.Encoding]::ASCII.GetString($buf, $off, $end - $off).Trim()
-    }
-
-    function Format-CsvField([string]$s) {
-        if ($s -match '[",\r\n]') { return '"' + $s.Replace('"', '""') + '"' }
-        return $s
-    }
-
-    function Format-Num([double]$v) {
-        return [Math]::Round($v, 4).ToString('0.0###', $inv)
-    }
-
-    function Convert-FastLog([string]$src) {
-        $d = [System.IO.File]::ReadAllBytes($src)
-
-        if ($d.Length -lt 0x210) {
-            Write-Error "${src}: file too small to be a FAST log"; return
-        }
-        $nchan = [BitConverter]::ToUInt16($d, 2)
-        if ($nchan -lt 1 -or $nchan -gt 32) {
-            Write-Error "${src}: implausible channel count $nchan; not a FAST Classic log?"; return
-        }
-        if ($d.Length -lt $DEF0 + $DEFSZ * $nchan + 22) {
-            Write-Error "${src}: truncated channel header"; return
-        }
-
-        # Channel definitions
-        $cols   = New-Object string[] $nchan
-        $scale  = New-Object double[] $nchan
-        $offset = New-Object double[] $nchan
-        for ($i = 0; $i -lt $nchan; $i++) {
-            $o     = $DEF0 + $DEFSZ * $i
-            $name  = Get-CString $d $o 16
-            $units = Get-CString $d ($o + 16) 8
-            $sc    = [double][BitConverter]::ToSingle($d, $o + 30)
-            $off   = [double][BitConverter]::ToSingle($d, $o + 34)
-
-            if (-not $units -or $name.Contains($units)) { $col = $name }
-            else { $col = "$name [$units]" }
-
-            if ($name.ToUpper().StartsWith('MAP') -and $sc -eq 1.0) {
-                $sc = $MAP_PSIA_PER_COUNT
-            }
-            $cols[$i] = $col; $scale[$i] = $sc; $offset[$i] = $off
-        }
-
-        # Data records
-        $data0 = $DEF0 + $DEFSZ * $nchan + 22
-        $recsz = 2 * $nchan + 4
-        $nrec  = [Math]::Floor(($d.Length - $data0) / $recsz)
-
-        $lines = New-Object System.Collections.Generic.List[string]
-        $hdr = @('Time_s') + ($cols | ForEach-Object { Format-CsvField $_ })
-        $lines.Add($hdr -join ',')
-
-        $prevTs = -1L; $firstT = $null; $lastT = $null; $count = 0
-        $fields = New-Object string[] ($nchan + 1)
-        $o = $data0
-        for ($r = 0; $r -lt $nrec; $r++) {
-            $ts = [long][BitConverter]::ToUInt32($d, $o + 2 * $nchan)
-            if ($ts -lt $prevTs) { break }   # non-monotonic time: past end of data
-            $prevTs = $ts
-            $t = $ts / 1000.0
-            if ($null -eq $firstT) { $firstT = $t }
-            $lastT = $t
-
-            $fields[0] = $t.ToString('0.0##', $inv)
-            for ($c = 0; $c -lt $nchan; $c++) {
-                $raw = [BitConverter]::ToUInt16($d, $o + 2 * $c)
-                $fields[$c + 1] = Format-Num ($raw * $scale[$c] + $offset[$c])
-            }
-            $lines.Add($fields -join ',')
-            $count++
-            $o += $recsz
-        }
-
-        if ($count -eq 0) { Write-Error "${src}: no valid data records found"; return }
-
-        $base = [System.IO.Path]::GetFileNameWithoutExtension($src) + '.csv'
-        if ($OutDir) { $dst = Join-Path $OutDir $base }
-        else         { $dst = Join-Path ([System.IO.Path]::GetDirectoryName($src)) $base }
-
-        [System.IO.File]::WriteAllLines($dst, $lines.ToArray(), $utf8NoBom)
-        $dur = ($lastT - $firstT).ToString('0.0', $inv)
-        Write-Host "${src}: $count records, $nchan channels, ${dur}s -> $dst"
-    }
+Writes <name>.csv next to each input, or into OutDir when specified.
+"@ | Write-Output
 }
 
-process {
-    foreach ($p in $Path) {
-        $resolved = @(Resolve-Path -Path $p -ErrorAction SilentlyContinue)
-        if ($resolved.Count -eq 0) { Write-Warning "skip: cannot find $p"; continue }
-        foreach ($rp in $resolved) {
-            try { Convert-FastLog $rp.ProviderPath }
-            catch { Write-Warning "skip: $($rp.ProviderPath): $($_.Exception.Message)" }
+function Read-UInt16LE([byte[]]$Bytes, [int]$Offset) {
+    [BitConverter]::ToUInt16($Bytes, $Offset)
+}
+
+function Read-UInt32LE([byte[]]$Bytes, [int]$Offset) {
+    [BitConverter]::ToUInt32($Bytes, $Offset)
+}
+
+function Read-SingleLE([byte[]]$Bytes, [int]$Offset) {
+    [BitConverter]::ToSingle($Bytes, $Offset)
+}
+
+function Read-AsciiField([byte[]]$Bytes, [int]$Offset, [int]$Length) {
+    $value = [Text.Encoding]::ASCII.GetString($Bytes, $Offset, $Length)
+    $nul = $value.IndexOf([char]0)
+    if ($nul -ge 0) { $value = $value.Substring(0, $nul) }
+    $value.Trim()
+}
+
+function ConvertTo-CsvField([object]$Value) {
+    $text = [string]$Value
+    '"' + $text.Replace('"', '""') + '"'
+}
+
+if ($OutDir) {
+    if (-not (Test-Path -LiteralPath $OutDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    }
+    $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
+}
+
+foreach ($inputName in $InputFile) {
+    try {
+        $source = Get-Item -LiteralPath $inputName -ErrorAction Stop
+        if ($source.PSIsContainer) { throw "not a file" }
+        $bytes = [IO.File]::ReadAllBytes($source.FullName)
+
+        if ($bytes.Length -lt 0x210) {
+            throw "file too small to be a FAST log"
         }
+
+        $channelCount = Read-UInt16LE $bytes 2
+        if ($channelCount -lt 1 -or $channelCount -gt 32) {
+            throw "implausible channel count $channelCount; not a FAST Classic log?"
+        }
+
+        $definitionOffset = 0x204
+        $definitionSize = 58
+        $dataOffset = $definitionOffset + ($definitionSize * $channelCount) + 22
+        if ($dataOffset -gt $bytes.Length) {
+            throw "file ends before the channel definitions or data"
+        }
+
+        $channels = @()
+        for ($i = 0; $i -lt $channelCount; $i++) {
+            $offset = $definitionOffset + ($definitionSize * $i)
+            $name = Read-AsciiField $bytes $offset 16
+            $units = Read-AsciiField $bytes ($offset + 16) 8
+            $scale = Read-SingleLE $bytes ($offset + 30)
+            $channelOffset = Read-SingleLE $bytes ($offset + 34)
+
+            # MAP channels with a scale of 1 are raw sensor counts in these logs.
+            if ($name.ToUpperInvariant().StartsWith('MAP') -and $scale -eq 1.0) {
+                $scale = 14.7 / 245.0
+            }
+
+            $column = $name
+            if ($units -and -not $name.Contains($units)) {
+                $column = "$name [$units]"
+            }
+            $channels += [PSCustomObject]@{
+                Name = $column
+                Scale = [double]$scale
+                Offset = [double]$channelOffset
+            }
+        }
+
+        $recordSize = (2 * $channelCount) + 4
+        $recordCount = [math]::Floor(($bytes.Length - $dataOffset) / $recordSize)
+        $rows = New-Object System.Collections.Generic.List[string]
+        $previousTimestamp = [int64]-1
+        $firstTime = $null
+        $lastTime = $null
+
+        $header = @('Time_s') + @($channels | ForEach-Object { $_.Name })
+        $rows.Add(($header | ForEach-Object { ConvertTo-CsvField $_ }) -join ',')
+
+        for ($record = 0; $record -lt $recordCount; $record++) {
+            $offset = $dataOffset + ($record * $recordSize)
+            $timestamp = [int64](Read-UInt32LE $bytes ($offset + (2 * $channelCount)))
+            if ($timestamp -lt $previousTimestamp) { break }
+            $previousTimestamp = $timestamp
+            $time = $timestamp / 1000.0
+            if ($null -eq $firstTime) { $firstTime = $time }
+            $lastTime = $time
+
+            $fields = New-Object System.Collections.Generic.List[string]
+            $fields.Add((ConvertTo-CsvField ([string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0:0.####}', $time))))
+            for ($channel = 0; $channel -lt $channelCount; $channel++) {
+                $raw = Read-UInt16LE $bytes ($offset + (2 * $channel))
+                $value = ($raw * $channels[$channel].Scale) + $channels[$channel].Offset
+                $formatted = [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0:0.####}', $value)
+                $fields.Add((ConvertTo-CsvField $formatted))
+            }
+            $rows.Add($fields -join ',')
+        }
+
+        if ($null -eq $firstTime) {
+            throw 'no valid data records found'
+        }
+
+        if ($OutDir) {
+            $destination = Join-Path $OutDir ($source.BaseName + '.csv')
+        } else {
+            $destination = Join-Path $source.DirectoryName ($source.BaseName + '.csv')
+        }
+        [IO.File]::WriteAllLines($destination, $rows, (New-Object Text.UTF8Encoding($false)))
+
+        $duration = $lastTime - $firstTime
+        '{0}: {1} records, {2} channels, {3:0.0}s -> {4}' -f $source.FullName, ($rows.Count - 1), $channelCount, $duration, $destination
+    } catch {
+        Write-Error ("{0}: {1}" -f $inputName, $_.Exception.Message)
     }
 }
